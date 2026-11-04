@@ -38,13 +38,16 @@ GAP_COLORS = {
 
 # Human-friendly labels for the filter UI (internal Gap_Type values unchanged).
 GAP_LABELS = {
-    "Available": "✅ Available — safe for new work",
-    "Reserved_Same_Process": "⏳ Reserved — queued for same process",
-    "Post_Error_Window": "⚠️ Post-error — after failure/retry window",
+    "Available": "Available — safe for new work",
+    "Reserved_Same_Process": "Reserved — queued for same process",
+    "Post_Error_Window": "Post-error — after failure/retry window",
 }
 LABEL_TO_GAP = {v: k for k, v in GAP_LABELS.items()}
 
 WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# Discrete stops for the minimum-duration slider (in minutes).
+MIN_DURATION_OPTIONS = [0, 30, 60, 120, 180, 240, 360, 480, 600, 720]
 
 st.set_page_config(page_title="UiPath Gap Analysis", layout="wide")
 
@@ -155,22 +158,32 @@ def duration_chart(filt: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float, float]:
+def format_minutes(minutes: int) -> str:
+    """Format the slider value for display, e.g. 120 -> '≥ 2h 00m'."""
+    if minutes == 0:
+        return "Any length"
+    if minutes < 60:
+        return f"≥ {minutes} min"
+    return f"≥ {minutes // 60}h {minutes % 60:02d}m"
+
+
+def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float]:
     """Render the sidebar filter panel and return the selection.
 
-    Returns (robots, gap_types, weekdays, min_minutes, min_hours) where an
-    empty list means "no restriction". UX notes:
+    Returns (robots, gap_types, weekdays, min_minutes) where an empty list
+    means "no restriction". UX notes:
       - Robot: none selected = all robots; "Select all" shortcut button.
       - Weekday: Mon–Fri / Weekend quick presets + calendar-ordered list.
       - Duration slider: only gaps >= chosen length are shown, so users can
         answer "what fits my job?" without re-running the pipeline.
+        (st.select_slider returns a single value, not a tuple.)
     """
     with st.sidebar:
-        st.header("🔍 Filters")
+        st.header("Filters")
         st.caption("Empty = show all. Filters combine (AND).")
 
         # Robot ------------------------------------------------------------
-        st.subheader("🤖 Robot")
+        st.subheader("Robot")
         robot_options = sorted(df["robotName"].unique())
         if st.button("Select all robots", use_container_width=True):
             st.session_state["robot_sel"] = robot_options
@@ -183,7 +196,7 @@ def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float, float]:
         st.caption(f"Selected: **{len(robots) or len(robot_options)}** of {len(robot_options)}")
 
         # Gap type ---------------------------------------------------------
-        st.subheader("🟢 Gap type")
+        st.subheader("Gap type")
         gap_type_options = [GAP_LABELS[g] for g in GAP_LABELS if g in df["Gap_Type"].unique()]
         gap_labels = st.multiselect(
             "Gap types", gap_type_options, default=gap_type_options,
@@ -193,7 +206,7 @@ def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float, float]:
         gap_types = [LABEL_TO_GAP[g] for g in gap_labels]
 
         # Weekday ----------------------------------------------------------
-        st.subheader("📅 Weekday")
+        st.subheader("Weekday")
         col1, col2 = st.columns(2)
         if col1.button("Weekdays", use_container_width=True):
             st.session_state["weekday_sel"] = [d for d in WEEKDAY_ORDER if d in df["WeekDay"].unique()][:5]
@@ -206,22 +219,22 @@ def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float, float]:
         )
 
         # Min duration -----------------------------------------------------
-        st.subheader("⏱️ Minimum gap length")
-        min_minutes, min_hours = st.select_slider(
+        st.subheader("Minimum gap length")
+        min_minutes = st.select_slider(
             "Only show gaps at least this long",
-            options=[0, 30, 60, 120, 180, 240, 360, 480, 600, 720],
+            options=MIN_DURATION_OPTIONS,
             value=0,
-            format_func=lambda v: "Any length" if v == 0 else f"≥ {v // 60}h {v % 60:02d}m" if v >= 60 else f"≥ {v} min",
-            help="E.g. choose ≥ 120 min to see only 2-hour+ slots that fit a long job.",
+            format_func=format_minutes,
+            help="E.g. choose at least 120 min to see only 2-hour+ slots that fit a long job.",
         )
 
         st.divider()
-        if st.button("↩️ Clear all filters", use_container_width=True):
+        if st.button("Clear all filters", use_container_width=True):
             for key in ["robot_sel", "weekday_sel"]:
                 st.session_state[key] = []
             st.rerun()
 
-    return robots, gap_types, weekdays, float(min_minutes), float(min_hours)
+    return robots, gap_types, weekdays, float(min_minutes)
 
 
 def main() -> None:
@@ -240,7 +253,7 @@ def main() -> None:
 
     df = load_data(str(DATA_CSV))
 
-    robots, gap_types, weekdays, min_minutes, min_hours = render_filters(df)
+    robots, gap_types, weekdays, min_minutes = render_filters(df)
 
     filt = df
     if robots:
