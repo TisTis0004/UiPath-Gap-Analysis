@@ -1,188 +1,292 @@
 # UiPath Robot Capacity & Gap Analysis
 
-> Find the idle windows between UiPath jobs — and prove which ones are truly free to schedule new work.
+A data analysis and visualization project designed to identify idle time windows between UiPath robot jobs, classify available capacity, and determine which time slots are suitable for scheduling new automation processes.
 
-[![Python](https://img.shields.io/badge/Python-3.11-3776AB)](https://www.python.org/)
-[![pandas](https://img.shields.io/badge/pandas-2.x-150458)](https://pandas.pydata.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.30-FF4B4B)](https://streamlit.io/)
-[![Plotly](https://img.shields.io/badge/Plotly-5.x-3F4F75)](https://plotly.com/python/)
+## Overview
 
-**Live demo:** https://<your-app>.streamlit.app _(after Streamlit Community Cloud deploy — see [Deploy](#deploy-live-url))_
+UiPath Orchestrator manages the execution of automation jobs across multiple robots. However, gaps between consecutive jobs do not necessarily represent usable capacity. Some gaps may be associated with queued executions of the same process, recovery periods following failed jobs, or operational constraints.
 
-## Quick facts
+This project analyzes historical UiPath job execution data to identify these gaps and classify them according to their scheduling suitability.
 
-| | |
-|---|---|
-| Raw jobs analysed | 248,057 (`Jobs.csv`, Jan–Feb 2026) |
-| Free slots found | **4,077** in the last 1 month |
-| Available for new processes | **2,405 (59.0%)** |
-| Reserved (same process) | 1,630 (40.0%) |
+The solution implements a data processing pipeline using Python and pandas, supported by SQL-based analysis, Excel reporting, and an interactive Streamlit dashboard.
+
+## Live Demo
+
+Explore the interactive dashboard:
+
+**[Open UiPath Gap Analysis Dashboard](https://uipath-gap-analysis-abhbkzgfshuxjfb9a48cgh.streamlit.app/)**
+
+
+## Key Results
+
+| Metric | Result |
+|---|---:|
+| Total jobs analyzed | 248,057 |
+| Robots analyzed | 24 |
+| Free time slots identified | 4,077 |
+| Available for new processes | 2,405 (59.0%) |
+| Reserved for the same process | 1,630 (40.0%) |
 | Post-error windows | 42 (1.0%) |
-| Robots covered | 24 |
+
+*Results are based on the analyzed dataset covering January and February 2026, with the gap analysis restricted to the most recent month of available job history.*
 
 ## Business Problem
 
-UiPath Orchestrator schedules jobs back-to-back on each robot, but the
-schedule always leaves gaps: setup time, waiting for triggers, failed-run
-restarts. The RPA team needs to know **when a robot is genuinely idle and
-safe to book new work** — without colliding with queued same-process jobs
-or retry windows after failures.
+Efficient robot utilization is an important aspect of Robotic Process Automation (RPA) operations.
 
-This project answers that with a reproducible pipeline: raw job history →
-cleaned gaps → classified capacity → interactive dashboards.
+Although robots may appear idle between consecutive executions, not every idle interval is suitable for scheduling additional workloads. For example:
+
+- A subsequent job may belong to the same process, indicating that the available interval should remain reserved.
+- A failed execution may require a recovery or retry period.
+- Very short gaps may not provide sufficient time for another process to execute.
+- Extended idle intervals may represent overnight periods or scheduled maintenance windows.
+
+The objective is to distinguish genuinely available robot capacity from intervals that should remain reserved or excluded from scheduling.
 
 ## Data Sources
 
-| Source | Rows | What it contains | Sensitivity |
-|--------|------|------------------|-------------|
-| `Jobs.csv` | 248,057 × 21 cols | UiPath export: `jobId`, `jobStart`/`jobEnd`, `jobState`, `processName`, `releaseId`, `robotName`, `machineName`, `userName`, env/tenant | **Do not publish** — real Orchestrator data (94 MB). Git-ignored; only the aggregated output ships. |
-| `Config.xlsx` (`Settings` sheet) | 20 keys | Thresholds (`MIN_GAP_MINUTES=30`, `MAX_GAP_HOURS=12`, `RETRY_WINDOW_MINUTES=35`, `LOOKBACK_MONTHS=1`) + infra paths | Contains credentials/hostnames — **never commit** (git-ignored). Thresholds are re-declared as defaults in code. |
-| `data/Free_Slots_Analysis.csv` | 4,077 × 12 cols | Final gap table (anonymised robot ids only) | Safe to publish — feeds both dashboards. |
+The analysis uses the following data sources:
 
-Sample pipeline run (`output/analysis.log`):
+| Source | Description |
+|---|---|
+| `Jobs.csv` | Historical UiPath Orchestrator job execution records containing 248,057 rows and 21 columns. |
+| `Config.xlsx` | Configuration file containing analysis thresholds and operational parameters. |
+| `data/Free_Slots_Analysis.csv` | Processed and anonymized output containing 4,077 classified time slots. |
 
-```
-Loaded 248,057 rows → 22,029 in last month → 4,077 free slots
-Available 2,405 (59.0%) · Reserved 1,630 (40.0%) · Post-error 42
-```
+The raw job history and configuration files contain operationally sensitive information and are excluded from version control.
 
-## Data Cleaning & Reshaping (pandas)
+Only the aggregated analysis output is included in the repository.
 
-All logic lives in `free_slots_v2.py` as small, testable functions:
+## Data Processing Pipeline
 
-1. **`load_config()`** — reads `Config.xlsx` `Name`/`Value` sheet into a typed
-   `GapConfig` dataclass; invalid/missing values fall back to documented
-   defaults **with a logged warning** (never silent).
-2. **`clean_jobs()`** — `pd.to_datetime(errors="coerce")` on `jobStart`/`jobEnd`,
-   drops rows missing `robotName`/`jobStart`/`jobEnd` (duplicates kept — they
-   are distinct jobs).
-3. **`compute_gaps()`** — sorts by `robotName, jobStart`, filters to the last
-   `LOOKBACK_MONTHS` from `max(jobStart)`, then reshapes with a grouped
-   `shift(-1)` to get each job's successor (`NextJobStart`, `NextProcess`).
-   `GapDuration = NextJobStart − jobEnd`; the last job per robot (no
-   successor) is dropped. Duration filter `[30 min, 12 h]` and retry filter
-   (failed state + gap ≤ 35 min) are applied.
-4. **`classify_gaps()`** — vectorised `np`-style assignment: same
-   `processName` as next job → `Reserved_Same_Process`; else failed state →
-   `Post_Error_Window`; else `Available`.
-5. **`format_outputs()`** — projects to the stable 12-column schema
-   (`robotName`, `Date`, `WeekDay`, `Busy Duration`, …, `Gap_Type`,
-   `Safe_For_New_Process`) with human-readable durations (`12 hrs 33 mins`).
+The primary analysis is implemented in `free_slots_v2.py` using pandas and NumPy.
 
-The original SQLite variant (`free_slots_from_sqlite.py`) is kept for
-reference — it segments retry chains and merges overlapping gaps; differences
-are called out in Assumptions A7.
+The pipeline consists of five main stages:
+
+### 1. Configuration Loading
+
+`load_config()`
+
+Loads analysis parameters from the `Settings` sheet in `Config.xlsx` and maps them to a typed `GapConfig` dataclass.
+
+If configuration values are missing or invalid, documented default values are applied and warnings are logged.
+
+### 2. Data Cleaning
+
+`clean_jobs()`
+
+Prepares the raw job execution records for analysis by:
+
+- Converting `jobStart` and `jobEnd` into datetime objects.
+- Handling invalid timestamps using `errors="coerce"`.
+- Removing records with missing robot identifiers or execution timestamps.
+- Preserving duplicate records because they may represent distinct job executions.
+
+### 3. Gap Detection
+
+`compute_gaps()`
+
+Identifies idle intervals between consecutive jobs executed by the same robot.
+
+The process involves:
+
+1. Sorting records by `robotName` and `jobStart`.
+2. Restricting the analysis to the configured lookback period.
+3. Using grouped operations and `shift(-1)` to identify each job's successor.
+4. Calculating the interval between the current job's end time and the next job's start time.
+5. Filtering intervals according to the minimum and maximum duration thresholds.
+6. Excluding qualifying retry windows following failed executions.
+
+The final job for each robot is excluded because no subsequent execution exists to establish a measurable gap.
+
+### 4. Gap Classification
+
+`classify_gaps()`
+
+Each detected interval is assigned to one of three categories:
+
+| Classification | Description |
+|---|---|
+| `Available` | An idle interval that can potentially accommodate a new process. |
+| `Reserved_Same_Process` | An interval followed by another execution of the same process. |
+| `Post_Error_Window` | An interval associated with a failed execution and its potential recovery period. |
+
+Only intervals classified as `Available` are considered safe for scheduling new processes.
+
+### 5. Output Formatting
+
+`format_outputs()`
+
+Transforms the processed records into a standardized 12-column dataset containing information such as:
+
+- Robot identifier
+- Date and weekday
+- Previous job duration
+- Gap start and end times
+- Gap duration
+- Gap classification
+- Scheduling eligibility
+
+The resulting dataset is exported to `data/Free_Slots_Analysis.csv` and consumed by both reporting solutions.
 
 ## Assumptions & Methodology
 
-The pipeline **generates `output/ASSUMPTIONS.md` on every run** via
-`write_assumptions_log()` — the same table below, with the actual run's row
-counts. This is the audit trail a reviewer needs.
+The analysis uses predefined operational thresholds to distinguish meaningful scheduling opportunities from insignificant or potentially unsafe intervals.
 
-| ID | Assumption | Value | Why |
-|----|-----------|-------|-----|
-| A1 | Min schedulable gap | 30 min | Shorter windows are setup/restart noise, not bookable slots |
-| A2 | Max gap | 12 h | Longer idle time = overnight/maintenance, not a usable window |
-| A3 | Retry window | 35 min, states Failed/Canceled/Faulted/Stopped | A failure restarting within 35 min is a retry, not free capacity |
-| A4 | Classification | same process → Reserved; else failed → Post-Error; else Available | Same-process successor means queued work; only Available is safe |
-| A5 | Lookback | 1 month from `max(jobStart)` | Anchored at data, not calendar month → reproducible re-runs |
-| A6 | Invalid rows | drop missing key fields; drop last job per robot | No parseable timestamps / no successor ⇒ no gap |
-| A7 | Date attribution | gap dated by `jobEnd` | Keeps `Date`/`WeekDay`/`Gap_From` consistent; **cross-midnight gaps are kept** (bounded by the 12 h cap) — check `Gap_From`/`Gap_To` before scheduling |
+| Parameter | Value | Rationale |
+|---|---:|---|
+| Minimum gap duration | 30 minutes | Excludes short intervals that are generally unsuitable for additional workloads. |
+| Maximum gap duration | 12 hours | Excludes extended idle periods that may represent overnight or maintenance windows. |
+| Retry window | 35 minutes | Prevents recently failed executions from being treated as available capacity. |
+| Lookback period | 1 month | Focuses the analysis on recent robot utilization. |
+| Date attribution | Previous job end time | Provides consistent date and weekday attribution for detected gaps. |
 
-**Known limitations:** cross-midnight gaps are retained (unlike the SQLite
-variant's same-day rule); Post-Error gaps are never `Safe_For_New_Process`;
-threshold changes require re-running the pipeline (dashboards read the CSV).
+Additional considerations:
 
-## Visualizations / Dashboards
+- Jobs with missing essential identifiers or timestamps are excluded.
+- The last job for each robot is excluded because its subsequent idle interval cannot be determined.
+- Gaps crossing midnight are retained if they satisfy the configured duration constraints.
+- Post-error windows are never classified as safe for new processes.
+- Changes to analysis thresholds require regenerating the processed dataset before refreshing the dashboards.
 
-### Matplotlib charts (`output/` — static previews for GitHub)
+The pipeline also generates `output/ASSUMPTIONS.md`, documenting the assumptions and execution statistics for each analysis run.
 
-The live dashboard now uses interactive Plotly (see Option B); these PNGs
-remain as static snapshots because GitHub markdown can't render Plotly.
+## Dashboards & Visualizations
 
-![Robot capacity breakdown](output/robot_capacity_breakdown.png)
+The project provides two complementary reporting solutions.
 
-![Gap frequency heatmap](output/gap_frequency_heatmap.png)
+### Excel Dashboard
 
-![Gap duration distribution](output/gap_duration_distribution.png)
+Implemented in `build_excel_dashboard.py`.
 
-### Option A — Excel dashboard (`build_excel_dashboard.py`)
+The generated workbook includes:
 
-```bash
-pip install pandas XlsxWriter openpyxl
-python build_excel_dashboard.py          # → output/Free_Slots_Dashboard.xlsx
-```
+| Worksheet | Description |
+|---|---|
+| `KPI_Summary` | Key performance indicators using Excel formulas. |
+| `Pivots` | Robot-level and weekday-level breakdowns by gap classification. |
+| `Raw_Data` | Processed records with filters, formatting, and conditional highlighting. |
+| `Charts` | Native Excel charts for visual analysis. |
 
-Sheets: `KPI_Summary` (live `COUNTIFS` + `XLOOKUP` formulas), `Pivots`
-(robot × type, weekday × type), `Raw_Data` (4,077 rows, Table + filters +
-conditional formatting), `Charts` (native bar chart). Proves the
-**Excel / Pivot / XLOOKUP** requirement end-to-end.
+The workbook uses Excel functions such as `COUNTIFS` and `XLOOKUP`, alongside pivot tables and conditional formatting.
 
-### Option B — Interactive dashboard (`app.py`, Streamlit + Plotly)
+### Interactive Dashboard
 
-```bash
-pip install streamlit pandas plotly
-streamlit run app.py
-```
+Implemented in `app.py` using Streamlit and Plotly.
 
-KPI cards (Total / Available / Reserved / Post-error), sidebar filters
-(robot, gap type, weekday), and **three fully interactive Plotly charts**:
-a stacked capacity bar per robot, an hour × robot heatmap, and a duration
-histogram with the 30 min / 12 h thresholds marked. Charts **re-render live
-when you change the filters** (hover, zoom, pan) — no static images. The
-matplotlib PNGs in `output/` are kept only as static previews for GitHub's
-markdown viewer (GitHub can't render interactive Plotly).
-Deployed live — see next section.
+The dashboard provides:
 
-Content is generated by `free_slots_v2.py`; both dashboards are read-only
-wrappers around `data/Free_Slots_Analysis.csv`.
+**Key Performance Indicators**
+- Total identified gaps.
+- Available scheduling windows.
+- Reserved intervals.
+- Post-error windows.
 
-## Deploy live URL
+**Interactive Filters**
+- Robot selection.
+- Gap classification.
+- Weekday selection.
 
-The repo is Streamlit-Cloud-ready (`app.py` + `requirements.txt` + `data/`).
-After pushing to GitHub:
+**Visualizations**
+- Stacked bar chart showing capacity distribution across robots.
+- Heatmap displaying idle time distribution by hour and robot.
+- Histogram illustrating the distribution of gap durations, including the configured minimum and maximum thresholds.
 
-1. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
-2. Repo: `TisTis0004/UiPath-Gap-Analysis`, branch `main`, main file `app.py`.
-3. Click **Deploy** → you get `https://<app-name>.streamlit.app` — share that
-   link anywhere. No AWS account needed.
+The visualizations support interactive exploration through filtering, hovering, zooming, and panning.
 
-## Project structure
+Both dashboards consume the same processed CSV dataset, ensuring consistent reporting across the two interfaces.
 
-```
-.
-├── free_slots_v2.py          # pipeline (pandas) + ASSUMPTIONS.md generator
-├── free_slots_from_sqlite.py # original SQLite variant (reference)
-├── build_excel_dashboard.py  # Excel dashboard builder (Option A)
-├── app.py                    # Streamlit dashboard (Option B)
+## Alternative SQLite Implementation
+
+The repository also includes `free_slots_from_sqlite.py`, an earlier implementation of the analysis using SQLite.
+
+This version is retained as a reference implementation and provides an alternative approach to identifying idle intervals.
+
+Unlike the primary pandas implementation, the SQLite version includes additional handling for retry chains and overlapping gaps.
+
+## Project Structure
+
+```text
+UiPath-Gap-Analysis/
+│
+├── data/
+│   └── Free_Slots_Analysis.csv
+│
+├── output/
+│   ├── ASSUMPTIONS.md
+│   ├── analysis.log
+│   └── generated reports and visualizations
+│
+├── app.py
+├── free_slots_v2.py
+├── free_slots_from_sqlite.py
+├── build_excel_dashboard.py
 ├── requirements.txt
-├── data/Free_Slots_Analysis.csv   # published output (feeds app.py)
-├── output/                          # local artefacts (charts, log, xlsx)
-├── Jobs.csv / Config.xlsx           # raw inputs — git-ignored, never commit
+├── .gitignore
 └── README.md
 ```
 
-## Run it yourself
+Raw input files such as `Jobs.csv` and `Config.xlsx` are maintained locally and excluded from version control.
+
+## Technologies Used
+
+| Technology | Purpose |
+|---|---|
+| Python | Core implementation and data processing. |
+| pandas | Data cleaning, transformation, grouping, and gap detection. |
+| NumPy | Vectorized data classification and numerical operations. |
+| SQLite | Alternative implementation for querying and analyzing job records. |
+| Excel / XlsxWriter | Automated report generation, formulas, pivot tables, and charts. |
+| Streamlit | Interactive dashboard development. |
+| Plotly | Interactive data visualizations. |
+| Matplotlib | Static visualizations and reporting artifacts. |
+
+## Installation & Execution
+
+### Prerequisites
+
+- Python 3.10 or later.
+- Access to the required input files (`Jobs.csv` and `Config.xlsx`) for regenerating the analysis.
+
+### Setup
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/TisTis0004/UiPath-Gap-Analysis.git
 cd UiPath-Gap-Analysis
-pip install -r requirements.txt
-python free_slots_v2.py        # Jobs.csv + Config.xlsx → output/
-streamlit run app.py           # interactive dashboard
-python build_excel_dashboard.py  # Excel workbook
 ```
 
-## Why this repo (for recruiters)
+Install dependencies:
 
-- **Python / pandas** — grouped `shift` reshaping, vectorised classification,
-  typed config, logged stage-by-stage row audits.
-- **SQL** — the original `free_slots_from_sqlite.py` reads a curated SQLite
-  `jobs_all` table (`SELECT … WHERE jobStart IS NOT NULL …`); the CSV pipeline
-  is its portable twin.
-- **Excel** — `build_excel_dashboard.py` emits pivot tables, `COUNTIFS`,
-  `XLOOKUP`, conditional formatting and a native chart with XlsxWriter.
-- **BI / Dashboarding** — `app.py` is a deployable Streamlit BI app (KPIs,
-  filters, drill-down table), a Power-BI-in-code equivalent.
-- **Data discipline** — every source, threshold and adjustment is recorded in
-  the generated `ASSUMPTIONS.md`; raw/sensitive files are git-ignored.
+```bash
+pip install -r requirements.txt
+```
+
+### Run the Analysis
+
+```bash
+python free_slots_v2.py
+```
+
+This processes the raw job history and generates the classified gap dataset and analysis artifacts.
+
+### Launch the Interactive Dashboard
+
+```bash
+streamlit run app.py
+```
+
+### Generate the Excel Dashboard
+
+```bash
+python build_excel_dashboard.py
+```
+
+## Output
+
+The primary output is `data/Free_Slots_Analysis.csv`, which contains the classified robot idle intervals and their scheduling eligibility.
+
+This dataset serves as the shared input for the Excel and Streamlit reporting solutions.
+
+The analysis provides an auditable approach to understanding robot utilization and identifying potential opportunities for improving RPA scheduling efficiency.
