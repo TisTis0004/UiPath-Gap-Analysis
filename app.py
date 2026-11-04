@@ -36,6 +36,16 @@ GAP_COLORS = {
     "Post_Error_Window": "#e74c3c",
 }
 
+# Human-friendly labels for the filter UI (internal Gap_Type values unchanged).
+GAP_LABELS = {
+    "Available": "✅ Available — safe for new work",
+    "Reserved_Same_Process": "⏳ Reserved — queued for same process",
+    "Post_Error_Window": "⚠️ Post-error — after failure/retry window",
+}
+LABEL_TO_GAP = {v: k for k, v in GAP_LABELS.items()}
+
+WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 st.set_page_config(page_title="UiPath Gap Analysis", layout="wide")
 
 
@@ -67,6 +77,8 @@ def load_data(path: str) -> pd.DataFrame:
     df["Gap_Minutes"] = df["Gap Duration"].map(parse_duration_minutes)
     df["Gap_Hours"] = df["Gap_Minutes"] / 60.0
     df["Gap_Hour"] = df["Gap_From"].map(parse_hour)
+    # Pretty label for charts/legends; keeps original Gap_Type for filtering.
+    df["Gap_Type_Label"] = df["Gap_Type"].map(GAP_LABELS).fillna(df["Gap_Type"])
     return df
 
 
@@ -75,17 +87,18 @@ def capacity_chart(filt: pd.DataFrame) -> go.Figure:
     if filt.empty:
         return go.Figure()
     summary = (
-        filt.groupby(["robotName", "Gap_Type"])["Gap_Hours"]
+        filt.groupby(["robotName", "Gap_Type_Label"])["Gap_Hours"]
         .sum()
         .reset_index()
         .sort_values("Gap_Hours")
     )
+    color_map = {label: GAP_COLORS[gap] for gap, label in GAP_LABELS.items()}
     fig = px.bar(
         summary,
         x="Gap_Hours",
         y="robotName",
-        color="Gap_Type",
-        color_discrete_map=GAP_COLORS,
+        color="Gap_Type_Label",
+        color_discrete_map=color_map,
         barmode="stack",
         orientation="h",
         labels={"Gap_Hours": "Total Free Hours", "robotName": "Robot"},
@@ -142,6 +155,75 @@ def duration_chart(filt: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def render_filters(df: pd.DataFrame) -> tuple[list, list, list, float, float]:
+    """Render the sidebar filter panel and return the selection.
+
+    Returns (robots, gap_types, weekdays, min_minutes, min_hours) where an
+    empty list means "no restriction". UX notes:
+      - Robot: none selected = all robots; "Select all" shortcut button.
+      - Weekday: Mon–Fri / Weekend quick presets + calendar-ordered list.
+      - Duration slider: only gaps >= chosen length are shown, so users can
+        answer "what fits my job?" without re-running the pipeline.
+    """
+    with st.sidebar:
+        st.header("🔍 Filters")
+        st.caption("Empty = show all. Filters combine (AND).")
+
+        # Robot ------------------------------------------------------------
+        st.subheader("🤖 Robot")
+        robot_options = sorted(df["robotName"].unique())
+        if st.button("Select all robots", use_container_width=True):
+            st.session_state["robot_sel"] = robot_options
+        robots = st.multiselect(
+            "Robots", robot_options,
+            key="robot_sel",
+            placeholder="All robots (none selected)",
+            help="Leave empty to include every robot.",
+        )
+        st.caption(f"Selected: **{len(robots) or len(robot_options)}** of {len(robot_options)}")
+
+        # Gap type ---------------------------------------------------------
+        st.subheader("🟢 Gap type")
+        gap_type_options = [GAP_LABELS[g] for g in GAP_LABELS if g in df["Gap_Type"].unique()]
+        gap_labels = st.multiselect(
+            "Gap types", gap_type_options, default=gap_type_options,
+            help="Available = safe to schedule · Reserved = same-process queue · "
+                 "Post-error = after a failure (outside the retry window).",
+        )
+        gap_types = [LABEL_TO_GAP[g] for g in gap_labels]
+
+        # Weekday ----------------------------------------------------------
+        st.subheader("📅 Weekday")
+        col1, col2 = st.columns(2)
+        if col1.button("Weekdays", use_container_width=True):
+            st.session_state["weekday_sel"] = [d for d in WEEKDAY_ORDER if d in df["WeekDay"].unique()][:5]
+        if col2.button("Weekends", use_container_width=True):
+            st.session_state["weekday_sel"] = [d for d in WEEKDAY_ORDER if d in df["WeekDay"].unique()][5:]
+        weekday_options = [d for d in WEEKDAY_ORDER if d in df["WeekDay"].unique()]
+        weekdays = st.multiselect(
+            "Weekdays", weekday_options, key="weekday_sel",
+            placeholder="All weekdays (none selected)",
+        )
+
+        # Min duration -----------------------------------------------------
+        st.subheader("⏱️ Minimum gap length")
+        min_minutes, min_hours = st.select_slider(
+            "Only show gaps at least this long",
+            options=[0, 30, 60, 120, 180, 240, 360, 480, 600, 720],
+            value=0,
+            format_func=lambda v: "Any length" if v == 0 else f"≥ {v // 60}h {v % 60:02d}m" if v >= 60 else f"≥ {v} min",
+            help="E.g. choose ≥ 120 min to see only 2-hour+ slots that fit a long job.",
+        )
+
+        st.divider()
+        if st.button("↩️ Clear all filters", use_container_width=True):
+            for key in ["robot_sel", "weekday_sel"]:
+                st.session_state[key] = []
+            st.rerun()
+
+    return robots, gap_types, weekdays, float(min_minutes), float(min_hours)
+
+
 def main() -> None:
     """Render the dashboard."""
     st.title("UiPath Robot Capacity & Gap Analysis")
@@ -158,15 +240,7 @@ def main() -> None:
 
     df = load_data(str(DATA_CSV))
 
-    # --- Filters (sidebar) --------------------------------------------------
-    with st.sidebar:
-        st.header("Filters")
-        robots = st.multiselect("Robot", sorted(df["robotName"].unique()))
-        gap_types = st.multiselect(
-            "Gap type", sorted(df["Gap_Type"].unique()),
-            default=sorted(df["Gap_Type"].unique()),
-        )
-        weekdays = st.multiselect("Weekday", sorted(df["WeekDay"].unique()))
+    robots, gap_types, weekdays, min_minutes, min_hours = render_filters(df)
 
     filt = df
     if robots:
@@ -175,6 +249,11 @@ def main() -> None:
         filt = filt[filt["Gap_Type"].isin(gap_types)]
     if weekdays:
         filt = filt[filt["WeekDay"].isin(weekdays)]
+    if min_minutes:
+        filt = filt[filt["Gap_Minutes"] >= min_minutes]
+
+    total_all = len(df)
+    st.caption(f"Showing **{len(filt):,}** of {total_all:,} gaps")
 
     # --- KPI cards ----------------------------------------------------------
     total = len(filt)
@@ -188,6 +267,10 @@ def main() -> None:
     k3.metric("Reserved", reserved, f"{total and reserved / total * 100:.1f}%")
     k4.metric("Post-error", post_error)
 
+    if total == 0:
+        st.warning("No gaps match the current filters — try clearing a filter.")
+        return
+
     # --- Interactive Plotly charts (all three update with filters) ----------
     st.subheader("Capacity breakdown — Available vs Reserved")
     st.plotly_chart(capacity_chart(filt), use_container_width=True)
@@ -200,7 +283,10 @@ def main() -> None:
 
     # --- Data table (Power-BI-style drill-down) -----------------------------
     st.subheader("Gap detail")
-    st.dataframe(filt.drop(columns=["Gap_Minutes", "Gap_Hours", "Gap_Hour"]), use_container_width=True)
+    st.dataframe(
+        filt.drop(columns=["Gap_Minutes", "Gap_Hours", "Gap_Hour", "Gap_Type_Label"]),
+        use_container_width=True,
+    )
     st.download_button(
         "Download filtered CSV",
         filt.to_csv(index=False).encode(),
